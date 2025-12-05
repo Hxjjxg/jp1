@@ -1,103 +1,81 @@
-import { getTokenizer } from "kuromojin";
+import { tokenize } from "kuromojin";
 
-// ============================================
-// 优化 1: 全局缓存 Tokenizer（最关键优化）
-// ============================================
-// kuromoji/kuromojin 的字典很大，每次函数冷启动都要加载和解压
-// 全局缓存可以避免每次调用都重复加载字典
-let tokenizerPromise = null;
+const JSON_HEADERS = { "Content-Type": "application/json" };
+const KANJI_REGEX = /[㐀-鿿々]/;
 
-async function getCachedTokenizer() {
-    if (!tokenizerPromise) {
-        // 优化 2: 使用 CDN 托管字典（可选，减少函数包体积）
-        // 如果使用 CDN，取消下面的注释并配置 dicPath
-        // tokenizerPromise = getTokenizer({
-        //     dicPath: "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict"
-        // });
-        
-        // 默认使用本地字典（如果已打包在函数中）
-        tokenizerPromise = getTokenizer();
-    }
-    return tokenizerPromise;
-}
-
-// ============================================
-// 优化 3: 文本缓存（避免重复 tokenize 同样文本）
-// ============================================
-const textCache = new Map();
-const MAX_CACHE_SIZE = 1000; // 限制缓存大小，避免内存无限增长
-
-function getCachedResult(text) {
-    return textCache.get(text);
-}
-
-function setCachedResult(text, result) {
-    // 简单的 LRU：如果缓存过大，删除最旧的条目
-    if (textCache.size >= MAX_CACHE_SIZE) {
-        const firstKey = textCache.keys().next().value;
-        textCache.delete(firstKey);
-    }
-    textCache.set(text, result);
+/**
+ * 将片假名转为平假名
+ * @param {string} text
+ */
+function katakanaToHiragana(text = "") {
+    return text.replace(/[ァ-ン]/g, (char) =>
+        String.fromCharCode(char.charCodeAt(0) - 0x60)
+    );
 }
 
 /**
- * 给句子的汉字加注音（返回 surface 和 reading）
+ * 将分词后的结果转换为 ruby 字符串
  * @param {string} text
- * @returns {Promise<Array<{surface: string, reading: string}>>}
  */
-async function annotateReading(text) {
-    // 检查缓存
-    const cached = getCachedResult(text);
-    if (cached) {
-        return cached;
-    }
+async function annotateLine(text) {
+    const tokens = await tokenize(text);
 
-    // 使用缓存的 tokenizer
-    const tokenizer = await getCachedTokenizer();
-    const tokens = tokenizer.tokenize(text);
-
-    const result = tokens.map(t => ({
-        surface: t.surface_form,
-        reading: t.reading || ""
-    }));
-
-    // 保存到缓存
-    setCachedResult(text, result);
-    return result;
+    return tokens
+        .map(({ surface_form = "", reading = "" }) => {
+            if (!surface_form) return "";
+            if (!KANJI_REGEX.test(surface_form)) return surface_form;
+            const furigana = reading ? katakanaToHiragana(reading) : "";
+            return `<ruby>${surface_form}<rt>${furigana}</rt></ruby>`;
+        })
+        .join("");
 }
 
 // Netlify function entry
 export default async (req, context) => {
     try {
-        const { text } = await req.json();
+        const { str, mode, to, romajiSystem } = await req.json();
 
-        if (!text) {
+        if (typeof str !== "string" || !str.trim()) {
             return new Response(
-                JSON.stringify({ error: "Missing 'text' field" }),
-                { status: 400, headers: { "Content-Type": "application/json" } }
+                JSON.stringify({ error: "Missing or invalid 'str' field" }),
+                { status: 400, headers: JSON_HEADERS }
             );
         }
 
-        // 优化 4: 文本预处理（去除无用字符，降低内存占用）
-        const cleanedText = text.trim();
-
-        if (!cleanedText) {
+        if (mode && mode !== "furigana") {
             return new Response(
-                JSON.stringify({ error: "Text cannot be empty" }),
-                { status: 400, headers: { "Content-Type": "application/json" } }
+                JSON.stringify({ error: "Unsupported mode" }),
+                { status: 400, headers: JSON_HEADERS }
             );
         }
 
-        const result = await annotateReading(cleanedText);
+        if (to && to !== "hiragana") {
+            return new Response(
+                JSON.stringify({ error: "Unsupported target" }),
+                { status: 400, headers: JSON_HEADERS }
+            );
+        }
 
-        return new Response(JSON.stringify(result), {
-            headers: { "Content-Type": "application/json" }
+        if (romajiSystem && romajiSystem !== "hepburn") {
+            return new Response(
+                JSON.stringify({ error: "Unsupported romaji system" }),
+                { status: 400, headers: JSON_HEADERS }
+            );
+        }
+
+        const lines = str.split("\n");
+        const annotatedLines = await Promise.all(
+            lines.map((line) => annotateLine(line))
+        );
+        const body = annotatedLines.join("\n");
+
+        return new Response(JSON.stringify(body), {
+            headers: JSON_HEADERS,
         });
-
     } catch (err) {
         return new Response(
             JSON.stringify({ error: err.message }),
-            { status: 500, headers: { "Content-Type": "application/json" } }
+            { status: 500, headers: JSON_HEADERS }
         );
     }
 };
